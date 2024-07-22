@@ -43,33 +43,47 @@ You can use this config as an example, just adjust the MQTT topic names accordin
 
 
 ```yaml
-fan:
-  - platform: mqtt
-    command_topic: "dmiot2mqtt/192.168.100.5/command"
-    command_template: '{ "power": {{ value }} }'
-    oscillation_command_topic: "dmiot2mqtt/192.168.100.5/command"
-    oscillation_command_template: '{ "roll_enable": {{ value }}}'
-    oscillation_state_topic: "dmiot2mqtt/192.168.100.5"
-    oscillation_value_template: "{{ value_json.roll_enable }}"
-    state_topic: "dmiot2mqtt/192.168.100.5"
-    state_value_template: "{{ value_json.power }}"
-    payload_on: "1"
-    payload_off: "0"
-    payload_oscillation_on: "1"
-    payload_oscillation_off: "0"
-    percentage_command_topic: "dmiot2mqtt/192.168.100.5/command"
-    percentage_command_template: '{ "speed": {{value}} }'
-    percentage_state_topic: "dmiot2mqtt/192.168.100.5"
-    percentage_value_template: "{{ value_json.speed }}"
-    json_attributes_topic: "dmiot2mqtt/192.168.100.5"
-    preset_modes:
-      - direct
-      - natural
-      - smart
-    preset_mode_command_template: '{% if value == "natural" %}{"mode":1}{% elif value == "smart" %}{"mode":2}{% else %}{ "mode":0}{% endif %}'
-    preset_mode_command_topic: "dmiot2mqtt/192.168.100.5/command"
-    preset_mode_state_topic: "dmiot2mqtt/192.168.100.5"
-    preset_mode_value_template: '{% if value_json.mode == 1 %}natural{% elif value_json.mode == 2 %}smart{% else %}direct{% endif %}'
-    name: "DreamMaker Fan"
-    unique_id: "mqtt_fan_dmfan01"
+mqtt:
+  fan:
+    - name: "DreamMaker Fan"
+      unique_id: "mqtt_fan_dmfan01"
+      command_topic: "dmiot2mqtt/192.168.100.5/command"
+      command_template: '{ "power": {{ value }} }'
+      oscillation_command_topic: "dmiot2mqtt/192.168.100.5/command"
+      oscillation_command_template: '{ "roll_enable": {{ value }}}'
+      oscillation_state_topic: "dmiot2mqtt/192.168.100.5"
+      oscillation_value_template: "{{ value_json.roll_enable }}"
+      state_topic: "dmiot2mqtt/192.168.100.5"
+      state_value_template: "{{ value_json.power }}"
+      payload_on: "1"
+      payload_off: "0"
+      payload_oscillation_on: "1"
+      payload_oscillation_off: "0"
+      percentage_command_topic: "dmiot2mqtt/192.168.100.5/command"
+      percentage_command_template: '{ "speed": {{value}} }'
+      percentage_state_topic: "dmiot2mqtt/192.168.100.5"
+      percentage_value_template: "{{ value_json.speed }}"
+      json_attributes_topic: "dmiot2mqtt/192.168.100.5"
+      preset_modes:
+        - direct
+        - natural
+        - smart
+      preset_mode_command_template: '{% if value == "natural" %}{"mode":1}{% elif value == "smart" %}{"mode":2}{% else %}{ "mode":0}{% endif %}'
+      preset_mode_command_topic: "dmiot2mqtt/192.168.100.5/command"
+      preset_mode_state_topic: "dmiot2mqtt/192.168.100.5"
+      preset_mode_value_template: '{% if value_json.mode == 1 %}natural{% elif value_json.mode == 2 %}smart{% else %}direct{% endif %}'
+
+  select:
+    - command_topic: "dmiot2mqtt/192.168.100.5/command"
+      command_template: '{ "roll_angle": {{value|int}} }'
+      name: "DreamMaker Fan Angle"
+      options:
+        - "30"
+        - "60"
+        - "90"
+        - "120"
+        - "140"
+      state_topic: "dmiot2mqtt/192.168.100.5"
+      value_template: "{{ value_json.roll_angle }}"
+      unique_id: mqtt_fan_dmfan01_angle
 ```
