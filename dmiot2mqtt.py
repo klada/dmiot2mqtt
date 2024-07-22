@@ -24,10 +24,9 @@ import os
 import sys
 
 try:
-    from amqtt.client import MQTTClient
-    from amqtt.mqtt.constants import QOS_0
+    import aiomqtt
 except ImportError:
-    sys.exit("amqtt library is missing, quitting...")
+    sys.exit("aiomqtt library is missing, quitting...")
     
 
 HOST = '0.0.0.0'
@@ -58,7 +57,6 @@ class DreamMakerIotClient:
         self.client_ip = addr[0]
         self.stream_reader = stream_reader
         self.stream_writer = stream_writer
-        self.mqtt_client = MqttConfig.get_client()
 
     async def async_authenticate_client(self) -> bool:
         while not self.is_connection_closed():
@@ -119,25 +117,36 @@ class DreamMakerIotClient:
         # Just add a dummy device_key/device_id. We won't need this information later.
         response["data"] = {"device_key":"0000000000000000", "device_id":"000000000000000000000000"}
         await self.async_send_data(response)
+ 
+    async def async_mqtt_listen(self):
+        async with aiomqtt.Client(**MqttConfig.get_mqtt_client_kwargs()) as mqtt_client:
+            logger.debug("in with mqtt")
+            
+            mqtt_base = os.path.join(MqttConfig.base_topic, self.client_ip.lower())
+            mqtt_command_topic = os.path.join(mqtt_base, "command")
+
+            # Async MQTT subscription
+            await mqtt_client.subscribe(mqtt_command_topic)
+            logger.debug("MQTT subscribe to %s finish", mqtt_command_topic)
+
+            async for message in mqtt_client.messages:
+                logger.debug("Received command {}".format(message.payload.decode()))
+                command = json.loads(message.payload.decode())
+                await self.async_send_command(command)
+
         
     async def async_run(self):
         """
         Main entry point for a new client connection.
-        """
-        await self.mqtt_client.connect(MqttConfig.get_uri())
-        
+        """       
         if not await self.async_authenticate_client():
             return False
-        
-        mqtt_base = os.path.join(MqttConfig.base_topic, self.client_ip.lower())
-        mqtt_topic = mqtt_base
-        mqtt_command_topic = os.path.join(mqtt_base, "command")
-        
-        await self.mqtt_client.subscribe([(mqtt_command_topic, QOS_0), ])
-        
+        logger.debug("Client authenticated")
+       
+            
         # Schedule two tasks, once one of them completes we need to take action
         tcp_task = asyncio.create_task(self.async_get_data())
-        mqtt_task = asyncio.create_task(self.mqtt_client.deliver_message())
+        mqtt_task = asyncio.create_task(self.async_mqtt_listen())
         
         ##
         # Main communication loop
@@ -147,6 +156,7 @@ class DreamMakerIotClient:
             done, pending = await asyncio.wait({tcp_task, mqtt_task}, return_when=asyncio.FIRST_COMPLETED)
         
             if tcp_task in done:
+                logger.debug("TCP task done, rescheduling....")
                 message = tcp_task.result()
                 # Make sure to create a new TCP reader task first
                 tcp_task = asyncio.create_task(self.async_get_data())
@@ -158,22 +168,22 @@ class DreamMakerIotClient:
                     if message["resource_id"] == self.RESOURCE_STATUS:
                         continue
                     data = message["data"]
-                    # publish message over mqtt
-                    await self.mqtt_client.publish(mqtt_topic, json.dumps(data).encode())
+                    async with aiomqtt.Client(**MqttConfig.get_mqtt_client_kwargs()) as mqtt_client:
+                        logger.debug("mqtt publush")
+                        
+                        mqtt_base = os.path.join(MqttConfig.base_topic, self.client_ip.lower())
+                        await mqtt_client.publish(mqtt_base, payload=json.dumps(data).encode())
             
             if mqtt_task in done:
+                logger.debug("MQTT task done, rescheduling....")
                 message = mqtt_task.result()
                 # Make sure to create a new MQTT subscriber task first
-                mqtt_task = asyncio.create_task(self.mqtt_client.deliver_message())
-                packet = message.publish_packet
-                logger.debug("Received command {}".format(packet.payload.data.decode()))
-                command = json.loads(packet.payload.data.decode())
-                await self.async_send_command(command)
+                mqtt_task = asyncio.create_task(self.async_mqtt_listen())
         
     async def async_stop(self):
         logger.info("Quit....")
         self.stream_writer.close()
-        await self.mqtt_client.disconnect()
+        #await self.mqtt_client.disconnect()
 
 
 class MqttConfig:
@@ -221,10 +231,15 @@ class MqttConfig:
         cls.retain = config["mqtt"].getboolean("retain", False)
     
     @classmethod
-    def get_client(cls) -> MQTTClient:
-        config = {"default_retain": cls.retain}
-        return MQTTClient(config=config)
-        
+    def get_mqtt_client_kwargs(cls) -> dict:
+        return {
+            'hostname': cls.server,
+            #'port': cls.port,
+            'username': cls.user,
+            'password': cls.password,
+            'clean_session': True,
+        }
+
 
 async def client_connected_callback(reader, writer):
     dreammakeriotclient = DreamMakerIotClient(reader, writer)

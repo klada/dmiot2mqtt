@@ -20,7 +20,7 @@ For this to work you need to have control over your local DNS. You need to alter
 This is what you need in order to get started:
 
 * Control over your local DNS (e.g. through your router or through Pi Hole)
-* Python 3.8 (or later) with amqtt
+* Python 3.9 (or later) with aiomqtt (Version 2.2 or later)
 * A MQTT broker
 * Ideally an always-on machine which will run dmiot2mqtt (e.g. a Raspberry Pi)
 * A static IP adress for your Dream Maker Smart Fan (IP will be used in MQTT topic)

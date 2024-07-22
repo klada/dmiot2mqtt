@@ -192,7 +192,7 @@ The attribute names are somewhat self-explanatory, but here is some more details
 * `mode`: `0` means "direct" mode, `1` means "natural" mode, `2` means "smart mode"
 * `power`: A value of `1` indicates that the device is turned on
 * `power_delay`: The device will turn off after the amount of `power_delay` minutes. The maximum is 480 minutes (8 hours).
-* `roll_angle`: unknown
+* `roll_angle`: The angle for the fan's oscillation. Possible values: `30`, `60`, `90`, `120`, `140`
 * `roll_enable`: Enables the fan's oscillation
 * `sound`: If set to `0` the device does not make any sound when pressing a button or changing it's mode. Default: `1`.
 * `source`: When the device is programmed through the official Dream Maker app using a smart schedule, this will be `auto`. Otherwise `manual`.
@@ -218,6 +218,7 @@ The following actions have been tested with the Dream Maker fan devices:
 * Disable button sounds: `{"sound": 0}`
 * Disable LED indicators: `{"light": 0}`
 * Enable oscillation: `{"roll_enable": 1}`
-* Turn fan one step left: `:{"roll_control":1}`
-* Turn fan one step right: `:{"roll_control":2}`
-* Enable smart mode (2): `:{"mode": 2}`
+* Turn fan one step left: `{"roll_control":1}`
+* Turn fan one step right: `{"roll_control":2}`
+* Change the fan's oscillation angle: `{"roll_angle": 30}`
+* Enable smart mode (2): `{"mode": 2}`
