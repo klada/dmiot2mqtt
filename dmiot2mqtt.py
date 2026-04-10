@@ -242,9 +242,20 @@ class MqttConfig:
 
 
 async def client_connected_callback(reader, writer):
+    addr = writer.get_extra_info('peername')
     dreammakeriotclient = DreamMakerIotClient(reader, writer)
-    await dreammakeriotclient.async_run()
-    await dreammakeriotclient.async_stop()
+    try:
+        await dreammakeriotclient.async_run()
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+        logger.warning(f"Client {addr!r} disconnected: {e}")
+    except Exception:
+        logger.exception(f"Unexpected error handling client {addr!r}")
+    finally:
+        try:
+            await dreammakeriotclient.async_stop()
+        except Exception:
+            pass
+        logger.info(f"Client {addr!r} handler finished, server still listening for new connections.")
 
 
 async def main():
