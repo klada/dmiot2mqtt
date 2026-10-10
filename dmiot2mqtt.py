@@ -22,6 +22,7 @@ import copy
 import json
 import logging
 import secrets
+import ssl
 import sys
 from typing import Dict, List, Optional
 
@@ -345,7 +346,9 @@ class DreamMakerIotClient:
             logger.warning("MQTT not connected, state will be published after reconnect")
             return
         try:
-            await client.publish(self.get_topic_base(), payload=json.dumps(data).encode())
+            await client.publish(
+                self.get_topic_base(), payload=json.dumps(data).encode(), retain=MqttConfig.retain
+            )
         except aiomqtt.MqttError as e:
             logger.warning("Publishing state failed: %s", e)
 
@@ -528,12 +531,14 @@ class MqttConfig:
         """
         config = configparser.ConfigParser()
         config.read(config_file)
+        if "bridge" in config:
+            BridgeConfig.read_timeout = config["bridge"].getint("read_timeout", BridgeConfig.read_timeout)
         if "mqtt" not in config:
             logger.warning("No MQTT config found, falling back to localhost")
             return
 
         cls.server = config["mqtt"].get("server", cls.server)
-        cls.port = config["mqtt"].get("port", cls.port)
+        cls.port = config["mqtt"].getint("port", cls.port)
         cls.base_topic = config["mqtt"].get("base_topic", cls.base_topic)
         cls.user = config["mqtt"].get("user", None)
         cls.password = config["mqtt"].get("password", None)
@@ -544,7 +549,7 @@ class MqttConfig:
     def get_mqtt_client_kwargs(cls, identifier: Optional[str] = None, will: Optional["aiomqtt.Will"] = None) -> dict:
         kwargs = {
             'hostname': cls.server,
-            #'port': cls.port,
+            'port': cls.port,
             'username': cls.user,
             'password': cls.password,
             'clean_session': True,
@@ -553,6 +558,8 @@ class MqttConfig:
             kwargs['identifier'] = identifier
         if will is not None:
             kwargs['will'] = will
+        if cls.use_ssl:
+            kwargs['tls_context'] = ssl.create_default_context()
         return kwargs
 
 

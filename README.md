@@ -28,13 +28,27 @@ This is what you need in order to get started:
 
 ## How to get this running?
 
-1. Pick a machine which will host `dmiot2mqtt.py`. It's recommended to create a new Python venv with amqtt installed within that environment.
+1. Pick a machine which will host `dmiot2mqtt.py`. It's recommended to create a new Python venv and run `pip3 install -r requirements.txt` inside.
 2. Create a DNS record which points `cloud1.dm-maker.com` to the machine running `dmiot2mqtt.py`.
 3. Adjust the config file `dmiot2mqtt.ini` according to your needs.
 4. Run the service through `python3 dmiot2mqtt.py -c /path/to/dmiot2mqtt.ini`.
 5. If your fan is still unprovisioned, use the `provision.py` script from this repository to push your WiFi information to the fan.
 6. Wait until your fan connects to the service.
 7. Create a systemd unit file for dmiot2mqtt.py according to your needs.
+
+## Configuration
+
+Options in `dmiot2mqtt.ini`:
+
+section | option | default | explanation
+--------|--------|---------|------------
+`mqtt` | `server` | `localhost` | MQTT broker hostname
+`mqtt` | `port` | `1883` | MQTT broker port. With `use_ssl = 1` this is usually `8883`
+`mqtt` | `base_topic` | `dmiot2mqtt` | Prefix of all topics
+`mqtt` | `user`, `password` | none | Broker credentials
+`mqtt` | `use_ssl` | `0` | Connect to the broker over TLS, verifying its certificate against the system CAs
+`mqtt` | `retain` | `0` | Publish the fan state as retained message, so Home Assistant knows it right after a restart
+`bridge` | `read_timeout` | `90` | Seconds without any data before a fan connection is treated as dead, `0` or less disables it. The 10-second heartbeat in doc/protocol.md is not verified for every model: if a fan (e.g. the battery-powered DM-FAN02-W) is dropped every `read_timeout` seconds, raise the value
 
 ## MQTT topics
 
@@ -52,7 +66,7 @@ Two bridge instances connected to the same broker therefore need different `base
 
 When a fan reconnects (e.g. after losing WiFi) while its old connection is still open, the old connection is closed.
 Two different fans behind one IP address (NAT) share a topic. If they report different device ids, the bridge keeps both connections and logs an error, but commands then reach both fans; give them different IP addresses. Fans provisioned through `provision.py` and this bridge all report the same all-zero device id and cannot be told apart at all, so behind one IP address they replace each other's connection over and over.
-A connection without any data for 90 seconds is treated as dead; the fans send a heartbeat every 10 seconds.
+A connection without any data for `read_timeout` seconds is treated as dead; the fans send a heartbeat every 10 seconds.
 
 ## Home Assistant integration
 
