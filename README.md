@@ -36,6 +36,19 @@ This is what you need in order to get started:
 6. Wait until your fan connects to the service.
 7. Create a systemd unit file for dmiot2mqtt.py according to your needs.
 
+## Docker
+
+Instead of steps 1, 4 and 7 above you can run the bridge as a container. Images for amd64, arm64 and armv7 (e.g. a Raspberry Pi) are published to `ghcr.io/lukaszkusgithub/dmiot2mqtt` for every version tag.
+Put your `dmiot2mqtt.ini` next to `docker-compose.yml` and run:
+
+```
+docker compose up -d
+```
+
+The container reads its config from `/config/dmiot2mqtt.ini` and listens on port 31270, which must be reachable from the fans under the address that `cloud1.dm-maker.com` resolves to.
+Inside the container `localhost` is the container itself, so set `server` to the broker's real address.
+Without `init: true` (or `docker run --init`) the bridge runs as process 1 and ignores the stop signal, so `docker stop` takes 10 seconds.
+
 ## Configuration
 
 Options in `dmiot2mqtt.ini`:
