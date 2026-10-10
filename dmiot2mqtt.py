@@ -21,10 +21,11 @@ import configparser
 import copy
 import json
 import logging
+import re
 import secrets
 import ssl
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
     import aiomqtt
@@ -194,12 +195,15 @@ class DreamMakerIotClient:
         # (see async_send_provisioning_data), so it cannot tell them apart.
         return bool(self.device_id and self.device_id.strip("0"))
 
-    def get_topic_base(self) -> str:
+    def get_fan_identifier(self) -> str:
         if MqttConfig.topic_id == "device_id" and self.has_usable_device_id():
             identifier = self.device_id
         else:
             identifier = self.client_ip
-        return f"{MqttConfig.base_topic}/{identifier.lower()}"
+        return identifier.lower()
+
+    def get_topic_base(self) -> str:
+        return f"{MqttConfig.base_topic}/{self.get_fan_identifier()}"
 
     def get_command_topic(self) -> str:
         return f"{self.get_topic_base()}/command"
@@ -415,6 +419,157 @@ class DreamMakerIotClient:
         except (ConnectionError, OSError) as e:
             logger.warning("Could not send command to fan: %s", e)
 
+    def get_discovery_node_id(self) -> str:
+        # Home Assistant accepts only these characters in a discovery topic
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", self.get_topic_base())
+
+    def build_discovery_configs(self) -> List[Tuple[str, dict]]:
+        """
+        Returns (topic, payload) pairs for Home Assistant MQTT discovery: the
+        fan, its settings and its sensors as entities of one device. All
+        topics in the payloads are this fan's topics, so they follow
+        base_topic and topic_id.
+        """
+        node_id = self.get_discovery_node_id()
+        state_topic = self.get_topic_base()
+        command_topic = self.get_command_topic()
+        common = {
+            "availability_topic": self.get_availability_topic(),
+            "device": {
+                "identifiers": [node_id],
+                "name": f"Dream Maker fan {self.get_fan_identifier()}",
+                "manufacturer": "Dream Maker",
+            },
+            "origin": {"name": "dmiot2mqtt"},
+        }
+
+        def switch(field: str, name: str, icon: str) -> dict:
+            return {
+                "name": name,
+                "icon": icon,
+                "entity_category": "config",
+                "state_topic": state_topic,
+                "value_template": f"{{{{ value_json.{field} }}}}",
+                "state_on": "1",
+                "state_off": "0",
+                "command_topic": command_topic,
+                "payload_on": json.dumps({field: 1}),
+                "payload_off": json.dumps({field: 0}),
+            }
+
+        entities = [
+            ("fan", "fan", {
+                # The entity takes the device name
+                "name": None,
+                "state_topic": state_topic,
+                "state_value_template": "{{ value_json.power }}",
+                "command_topic": command_topic,
+                "command_template": '{"power": {{ value }}}',
+                "payload_on": "1",
+                "payload_off": "0",
+                "percentage_state_topic": state_topic,
+                "percentage_value_template": "{{ value_json.speed }}",
+                "percentage_command_topic": command_topic,
+                # The fan accepts speeds from 1 to 100, so 0 turns it off
+                "percentage_command_template": (
+                    '{% if value | int == 0 %}{"power": 0}'
+                    '{% else %}{"speed": {{ value | int }}}{% endif %}'
+                ),
+                "speed_range_min": 1,
+                "speed_range_max": 100,
+                "oscillation_state_topic": state_topic,
+                "oscillation_value_template": "{{ value_json.roll_enable }}",
+                "oscillation_command_topic": command_topic,
+                "oscillation_command_template": '{"roll_enable": {{ value }}}',
+                "payload_oscillation_on": "1",
+                "payload_oscillation_off": "0",
+                "preset_modes": [self.MAP_MODES[mode] for mode in sorted(self.MAP_MODES)],
+                "preset_mode_state_topic": state_topic,
+                "preset_mode_value_template": (
+                    '{% if value_json.mode == 1 %}natural'
+                    '{% elif value_json.mode == 2 %}smart{% else %}direct{% endif %}'
+                ),
+                "preset_mode_command_topic": command_topic,
+                "preset_mode_command_template": (
+                    '{% if value == "natural" %}{"mode": 1}'
+                    '{% elif value == "smart" %}{"mode": 2}{% else %}{"mode": 0}{% endif %}'
+                ),
+                "json_attributes_topic": state_topic,
+            }),
+            ("select", "roll_angle", {
+                "name": "Oscillation angle",
+                "icon": "mdi:arrow-oscillating",
+                "entity_category": "config",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.roll_angle }}",
+                "command_topic": command_topic,
+                "command_template": '{"roll_angle": {{ value | int }}}',
+                "options": ["30", "60", "90", "120", "140"],
+            }),
+            ("number", "power_delay", {
+                "name": "Off timer",
+                "icon": "mdi:fan-clock",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.power_delay }}",
+                "command_topic": command_topic,
+                # Home Assistant sends numbers as floats, e.g. 30.0
+                "command_template": '{"power_delay": {{ value | int }}}',
+                "min": 0,
+                "max": 480,
+                "step": 1,
+                "unit_of_measurement": "min",
+            }),
+            ("switch", "light", switch("light", "LED indicators", "mdi:led-on")),
+            ("switch", "sound", switch("sound", "Button sounds", "mdi:volume-high")),
+            ("switch", "child_lock", switch("child_lock", "Child lock", "mdi:lock")),
+            ("sensor", "temperature", {
+                "name": "Temperature",
+                "device_class": "temperature",
+                "state_class": "measurement",
+                "unit_of_measurement": "°C",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.temperature }}",
+            }),
+            ("sensor", "humidity", {
+                "name": "Humidity",
+                "device_class": "humidity",
+                "state_class": "measurement",
+                "unit_of_measurement": "%",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.humidity }}",
+            }),
+        ]
+
+        configs = []
+        for component, object_id, entity in entities:
+            payload = dict(common, unique_id=f"{node_id}_{object_id}", **entity)
+            topic = f"{MqttConfig.discovery_prefix}/{component}/{node_id}/{object_id}/config"
+            configs.append((topic, payload))
+        return configs
+
+    def get_ha_status_topic(self) -> str:
+        return f"{MqttConfig.discovery_prefix}/status"
+
+    async def async_handle_ha_status(self, client: "aiomqtt.Client", payload):
+        """
+        Home Assistant publishes "online" on its status topic after it has
+        started. Without the retain option it would otherwise not know the
+        fan state until the fan reports its next change.
+        """
+        if payload != b"online":
+            return
+        logger.debug("Home Assistant started, publishing %s again", self.get_topic_base())
+        await self.async_publish_discovery(client)
+        if self.last_state is not None:
+            await self.async_publish_state(self.last_state)
+
+    async def async_publish_discovery(self, client: "aiomqtt.Client"):
+        if not MqttConfig.discovery:
+            return
+        for topic, payload in self.build_discovery_configs():
+            await client.publish(topic, payload=json.dumps(payload).encode(), qos=1, retain=True)
+        logger.debug("Published Home Assistant discovery for %s", self.get_topic_base())
+
     async def async_mqtt_loop(self):
         """
         Keeps one MQTT connection for this fan and reconnects when the broker
@@ -434,11 +589,18 @@ class DreamMakerIotClient:
                     # in reaction to "online" is not lost
                     await client.subscribe(self.get_command_topic())
                     logger.debug("MQTT subscribe to %s finished", self.get_command_topic())
+                    if MqttConfig.discovery:
+                        await client.subscribe(self.get_ha_status_topic())
+                    # The entities must exist before "online" makes them available
+                    await self.async_publish_discovery(client)
                     await self.async_publish_availability(b"online")
                     if self.last_state is not None:
                         await self.async_publish_state(self.last_state)
                     async for message in client.messages:
-                        await self.async_handle_mqtt_command(message.payload)
+                        if message.topic.matches(self.get_ha_status_topic()):
+                            await self.async_handle_ha_status(client, message.payload)
+                        else:
+                            await self.async_handle_mqtt_command(message.payload)
             except aiomqtt.MqttError as e:
                 logger.warning("MQTT connection lost (%s), reconnecting in %gs", e, delay)
             except Exception:
@@ -523,7 +685,10 @@ class MqttConfig:
     retain = False
     # Which value identifies a fan in the MQTT topic: "ip" or "device_id"
     topic_id = "ip"
-    
+    # Home Assistant MQTT discovery
+    discovery = True
+    discovery_prefix = "homeassistant"
+
     @classmethod
     def get_uri(cls):
         if cls.use_ssl:
@@ -565,6 +730,8 @@ class MqttConfig:
             logger.warning("Unknown topic_id %r, using 'ip'", topic_id)
             topic_id = "ip"
         cls.topic_id = topic_id
+        cls.discovery = config["mqtt"].getboolean("discovery", cls.discovery)
+        cls.discovery_prefix = config["mqtt"].get("discovery_prefix", cls.discovery_prefix).strip().strip("/")
     
     @classmethod
     def get_mqtt_client_kwargs(cls, identifier: Optional[str] = None, will: Optional["aiomqtt.Will"] = None) -> dict:

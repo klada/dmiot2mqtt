@@ -49,6 +49,8 @@ section | option | default | explanation
 `mqtt` | `use_ssl` | `0` | Connect to the broker over TLS, verifying its certificate against the system CAs
 `mqtt` | `retain` | `0` | Publish the fan state as retained message, so Home Assistant knows it right after a restart
 `mqtt` | `topic_id` | `ip` | Identify a fan in the topic by `ip` or by `device_id`. See the note below
+`mqtt` | `discovery` | `1` | Announce each fan to Home Assistant through MQTT discovery, see [Home Assistant integration](#home-assistant-integration)
+`mqtt` | `discovery_prefix` | `homeassistant` | Discovery prefix of the Home Assistant MQTT integration
 `bridge` | `read_timeout` | `90` | Seconds without any data before a fan connection is treated as dead, `0` or less disables it. The 10-second heartbeat in doc/protocol.md is not verified for every model: if a fan (e.g. the battery-powered DM-FAN02-W) is dropped every `read_timeout` seconds, raise the value
 
 With `topic_id = device_id` the fan does not need a static IP. This only works for fans that were provisioned through the official Dream Maker app and cloud: they keep the unique device id they got there. Fans provisioned through `provision.py` and this bridge all get the same all-zero device id; for those the bridge falls back to the IP address and logs a warning.
@@ -84,7 +86,24 @@ Tests that need the broker are skipped when `mosquitto` is not installed.
 
 ## Home Assistant integration
 
-Once you have your fan talking to dmiot2mqtt you can integrate it into Home Assistant.
+With `discovery = 1` (the default) and the Home Assistant MQTT integration connected to the same broker, every fan shows up in Home Assistant on its own, as a device of the MQTT integration. Its entities:
+
+entity | type | field
+-------|------|------
+the fan itself | `fan` | `power`, `speed`, `roll_enable` (oscillation), `mode` (preset `direct`, `natural`, `smart`)
+Oscillation angle | `select` | `roll_angle`
+Off timer | `number`, 0 to 480 minutes | `power_delay`
+LED indicators, Button sounds, Child lock | `switch` | `light`, `sound`, `child_lock`
+Temperature, Humidity | `sensor` | `temperature`, `humidity`
+
+The discovery messages are retained and published again whenever the bridge connects to the broker. When Home Assistant reports on `homeassistant/status` (with your `discovery_prefix`) that it has started, the bridge publishes them again together with the last fan state, so Home Assistant knows the state even without `retain = 1`.
+Temperature and humidity come with the fan's state update. doc/protocol.md describes that update after a change of the fan's status; how often a fan sends one when only the temperature changes is not documented, so the sensors may stay empty until the first change or command.
+Setting the speed to 0 turns the fan off. The fan accepts one field per command, so turning it on at a given speed takes two commands; Home Assistant sends them one after the other.
+
+If you added the fan manually with the YAML config below before, remove that config or set `discovery = 0`, otherwise every entity appears twice.
+With `topic_id = ip` a fan that gets a new IP address appears as a new device; delete the old one in Home Assistant.
+
+Without discovery you can integrate the fan manually.
 You can use this config as an example, just adjust the MQTT topic names according to your fan's IP address:
 
 

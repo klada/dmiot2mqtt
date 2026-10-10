@@ -104,7 +104,8 @@ def test_parser_drops_deeply_nested_data():
 
 @pytest.fixture
 def clean_config(monkeypatch):
-    for name in ("server", "port", "base_topic", "user", "password", "use_ssl", "retain", "topic_id"):
+    for name in ("server", "port", "base_topic", "user", "password", "use_ssl", "retain", "topic_id",
+                 "discovery", "discovery_prefix"):
         monkeypatch.setattr(MqttConfig, name, getattr(MqttConfig, name))
     monkeypatch.setattr(BridgeConfig, "read_timeout", BridgeConfig.read_timeout)
 
@@ -113,6 +114,7 @@ def test_config_reads_all_options(tmp_path, clean_config):
     ini = tmp_path / "test.ini"
     ini.write_text(
         "[mqtt]\nserver = broker\nport = 8883\nuse_ssl = 1\nretain = 1\ntopic_id = device_id\n"
+        "discovery = 0\ndiscovery_prefix = ha/\n"
         "[bridge]\nread_timeout = 30\n"
     )
     MqttConfig.read_config(str(ini))
@@ -122,6 +124,8 @@ def test_config_reads_all_options(tmp_path, clean_config):
     assert kwargs["tls_context"] is not None
     assert MqttConfig.retain is True
     assert MqttConfig.topic_id == "device_id"
+    assert MqttConfig.discovery is False
+    assert MqttConfig.discovery_prefix == "ha"
     assert BridgeConfig.read_timeout == 30
 
 
@@ -134,6 +138,8 @@ def test_config_defaults_and_unknown_topic_id(tmp_path, clean_config):
     assert "tls_context" not in kwargs
     assert MqttConfig.retain is False
     assert MqttConfig.topic_id == "ip"
+    assert MqttConfig.discovery is True
+    assert MqttConfig.discovery_prefix == "homeassistant"
 
 
 # ----------------------------------------------------------------------
@@ -307,7 +313,10 @@ def bridge_config(monkeypatch, request, clean_config):
     def configure(broker_port, **options):
         monkeypatch.setattr(MqttConfig, "server", "127.0.0.1")
         monkeypatch.setattr(MqttConfig, "port", broker_port)
-        monkeypatch.setattr(MqttConfig, "base_topic", f"t{abs(hash(request.node.nodeid)) % 10**8}")
+        test_id = abs(hash(request.node.nodeid)) % 10**8
+        monkeypatch.setattr(MqttConfig, "base_topic", f"t{test_id}")
+        monkeypatch.setattr(MqttConfig, "discovery", options.get("discovery", True))
+        monkeypatch.setattr(MqttConfig, "discovery_prefix", f"ha{test_id}")
         monkeypatch.setattr(MqttConfig, "retain", options.get("retain", True))
         monkeypatch.setattr(MqttConfig, "topic_id", options.get("topic_id", "ip"))
         monkeypatch.setattr(BridgeConfig, "read_timeout", options.get("read_timeout", 90))
@@ -637,7 +646,7 @@ async def test_subscribes_before_announcing_online(broker, bridge, bridge_config
 
         async def subscribe(self, topic_filter, *args, **kwargs):
             if self.is_bridge:
-                events.append("subscribe")
+                events.append(topic_filter)
             return await super().subscribe(topic_filter, *args, **kwargs)
 
         async def publish(self, topic_name, payload=None, *args, **kwargs):
@@ -648,7 +657,7 @@ async def test_subscribes_before_announcing_online(broker, bridge, bridge_config
     monkeypatch.setattr(dmiot2mqtt.aiomqtt, "Client", RecordingClient)
     async with Subscriber(broker, f"{MqttConfig.base_topic}/#") as subscriber:
         await connect_online(bridge, subscriber)
-    assert events[:2] == ["subscribe", b"online"], events
+    assert topic("command") in events[:events.index(b"online")], events
 
 
 @needs_broker
@@ -814,3 +823,167 @@ async def test_all_zero_device_id_falls_back_to_ip(broker, bridge, bridge_config
         await fan.receive_ack(9031)
         await subscriber.wait_for(topic())
         assert not any("0000000000" in str(m.topic) for m in subscriber.messages)
+
+
+# ----------------------------------------------------------------------
+# Home Assistant discovery
+# ----------------------------------------------------------------------
+
+DISCOVERED = {
+    ("fan", "fan"), ("select", "roll_angle"), ("number", "power_delay"), ("switch", "light"),
+    ("switch", "sound"), ("switch", "child_lock"), ("sensor", "temperature"), ("sensor", "humidity"),
+}
+
+
+class StubWriter:
+    def get_extra_info(self, name):
+        return ("192.168.1.5", 50000)
+
+
+def discovery_for(device_id=None):
+    client = dmiot2mqtt.DreamMakerIotClient(None, StubWriter())
+    client.device_id = device_id
+    return dict(client.build_discovery_configs())
+
+
+def test_discovery_topics_and_entities(clean_config):
+    MqttConfig.base_topic = "fans"
+    configs = discovery_for()
+    node = "fans_192_168_1_5"
+    assert set(configs) == {f"homeassistant/{c}/{node}/{o}/config" for c, o in DISCOVERED}
+    unique_ids = [payload["unique_id"] for payload in configs.values()]
+    assert len(set(unique_ids)) == len(DISCOVERED)
+    for payload in configs.values():
+        assert payload["availability_topic"] == "fans/192.168.1.5/availability"
+        assert payload["device"]["identifiers"] == [node]
+        topics = [value for key, value in payload.items() if key.endswith("_topic")]
+        assert topics and all(t.startswith("fans/192.168.1.5") for t in topics), payload
+
+
+def test_discovery_follows_topic_id(clean_config):
+    MqttConfig.topic_id = "device_id"
+    MqttConfig.discovery_prefix = "ha"
+    configs = discovery_for(DEVICE_ID)
+    node = f"dmiot2mqtt_{DEVICE_ID.lower()}"
+    assert f"ha/fan/{node}/fan/config" in configs
+    assert configs[f"ha/fan/{node}/fan/config"]["state_topic"] == f"dmiot2mqtt/{DEVICE_ID.lower()}"
+
+
+def test_discovery_templates_produce_fan_commands(clean_config):
+    jinja2 = pytest.importorskip("jinja2")
+    env = jinja2.Environment()
+    configs = {topic.split("/")[-2]: payload for topic, payload in discovery_for().items()}
+
+    def command(entity, key, value):
+        rendered = env.from_string(configs[entity][key]).render(value=value)
+        result = json.loads(rendered)
+        # The bridge forwards only non-empty JSON objects
+        assert isinstance(result, dict) and result
+        return result
+
+    def state(entity, key, data):
+        return env.from_string(configs[entity][key]).render(value_json=data)
+
+    assert command("fan", "command_template", "1") == {"power": 1}
+    assert command("fan", "percentage_command_template", 0) == {"power": 0}
+    assert command("fan", "percentage_command_template", 37) == {"speed": 37}
+    assert command("fan", "oscillation_command_template", "0") == {"roll_enable": 0}
+    assert command("fan", "preset_mode_command_template", "natural") == {"mode": 1}
+    assert command("fan", "preset_mode_command_template", "smart") == {"mode": 2}
+    assert command("fan", "preset_mode_command_template", "direct") == {"mode": 0}
+    assert command("roll_angle", "command_template", "90") == {"roll_angle": 90}
+    # The fan expects whole minutes, not 30.0
+    assert type(command("power_delay", "command_template", 30.0)["power_delay"]) is int
+    for name in ("light", "sound", "child_lock"):
+        assert json.loads(configs[name]["payload_on"]) == {name: 1}
+        assert json.loads(configs[name]["payload_off"]) == {name: 0}
+
+    data = {"power": 1, "speed": 40, "mode": 1, "roll_enable": 0, "roll_angle": 90,
+            "power_delay": 15, "light": 1, "temperature": 23.6, "humidity": 64}
+    assert state("fan", "state_value_template", data) == configs["fan"]["payload_on"]
+    assert state("fan", "percentage_value_template", data) == "40"
+    assert state("fan", "oscillation_value_template", data) == configs["fan"]["payload_oscillation_off"]
+    assert state("fan", "preset_mode_value_template", data) == "natural"
+    assert state("roll_angle", "value_template", data) in configs["roll_angle"]["options"]
+    assert state("light", "value_template", data) == configs["light"]["state_on"]
+    assert state("temperature", "value_template", data) == "23.6"
+    assert state("humidity", "value_template", data) == "64"
+
+
+@needs_broker
+async def test_discovery_is_published_retained_before_online(broker, bridge, bridge_config, monkeypatch):
+    bridge_config(broker)
+    published = []
+
+    class RecordingClient(aiomqtt.Client):
+        def __init__(self, *args, **kwargs):
+            self.is_bridge = kwargs.get("identifier") is not None
+            super().__init__(*args, **kwargs)
+
+        async def publish(self, topic_name, payload=None, *args, **kwargs):
+            if self.is_bridge:
+                published.append((str(topic_name), payload, kwargs.get("retain")))
+            return await super().publish(topic_name, payload, *args, **kwargs)
+
+    monkeypatch.setattr(dmiot2mqtt.aiomqtt, "Client", RecordingClient)
+    async with Subscriber(broker, f"{MqttConfig.base_topic}/#") as subscriber:
+        await connect_online(bridge, subscriber)
+    prefix = MqttConfig.discovery_prefix + "/"
+    online = published.index((topic("availability"), b"online", True))
+    discovery = [i for i, (t, _, _) in enumerate(published) if t.startswith(prefix)]
+    assert len(discovery) == len(DISCOVERED)
+    assert max(discovery) < online
+    assert all(published[i][2] is True for i in discovery)
+    assert all(b"secretkey" not in published[i][1] for i in discovery)
+    fan_config = f"{prefix}fan/{MqttConfig.base_topic}_127_0_0_1/fan/config"
+    assert json.loads(await retained_payload(broker, fan_config))["state_topic"] == topic()
+
+
+@needs_broker
+async def test_discovery_can_be_disabled(broker, bridge, bridge_config):
+    bridge_config(broker, discovery=False)
+    async with Subscriber(broker, f"{MqttConfig.discovery_prefix}/#") as discovery:
+        async with Subscriber(broker, f"{MqttConfig.base_topic}/#") as subscriber:
+            await connect_online(bridge, subscriber)
+        await asyncio.sleep(0.2)
+        assert discovery.messages == []
+
+
+@needs_broker
+async def test_discovery_ids_survive_reconnect(broker, bridge, bridge_config):
+    bridge_config(broker)
+    configs = []
+    async with Subscriber(broker, f"{MqttConfig.discovery_prefix}/#") as discovery:
+        async with Subscriber(broker, f"{MqttConfig.base_topic}/#") as subscriber:
+            for _ in range(2):
+                discovery.messages.clear()
+                subscriber.messages.clear()
+                fan = await connect_online(bridge, subscriber)
+                await wait_until(lambda: len(discovery.messages) == len(DISCOVERED))
+                configs.append({str(m.topic): json.loads(m.payload)["unique_id"] for m in discovery.messages})
+                await fan.close()
+                await subscriber.wait_for(topic("availability"), b"offline")
+    assert configs[0] == configs[1]
+
+
+@needs_broker
+async def test_state_is_sent_again_when_home_assistant_starts(broker, bridge, bridge_config):
+    bridge_config(broker, retain=False)
+    status = f"{MqttConfig.discovery_prefix}/status"
+    async with Subscriber(broker, f"{MqttConfig.base_topic}/#") as subscriber:
+        fan = await connect_online(bridge, subscriber)
+        await fan.send(STATE)
+        await fan.receive_ack(9031)
+        await subscriber.wait_for(topic())
+        async with Subscriber(broker, f"{MqttConfig.discovery_prefix}/+/+/+/config") as discovery:
+            await wait_until(lambda: len(discovery.messages) == len(DISCOVERED))
+            discovery.messages.clear()
+            subscriber.messages.clear()
+            async with aiomqtt.Client("127.0.0.1", port=broker) as home_assistant:
+                await home_assistant.publish(status, b"offline")
+                await asyncio.sleep(0.3)
+                assert subscriber.payloads(topic()) == []
+                await home_assistant.publish(status, b"online")
+            message = await subscriber.wait_for(topic())
+            assert json.loads(message.payload) == STATE["data"]
+            await wait_until(lambda: len(discovery.messages) == len(DISCOVERED))
