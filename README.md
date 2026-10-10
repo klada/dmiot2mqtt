@@ -71,6 +71,17 @@ When a fan reconnects (e.g. after losing WiFi) while its old connection is still
 Two different fans behind one IP address (NAT) share a topic unless `topic_id = device_id` is used. If they report different device ids, the bridge keeps both connections and logs an error, but with `topic_id = ip` commands then reach both fans; use `topic_id = device_id` or give them different IP addresses. Fans provisioned through `provision.py` and this bridge all report the same all-zero device id and cannot be told apart at all, so behind one IP address they replace each other's connection over and over; they need different IP addresses.
 A connection without any data for `read_timeout` seconds is treated as dead; the fans send a heartbeat every 10 seconds.
 
+## Tests
+
+The tests start a local `mosquitto` broker and talk to the bridge through a simulated fan:
+
+```
+pip3 install -r requirements-dev.txt
+python3 -m pytest tests
+```
+
+Tests that need the broker are skipped when `mosquitto` is not installed.
+
 ## Home Assistant integration
 
 Once you have your fan talking to dmiot2mqtt you can integrate it into Home Assistant.
