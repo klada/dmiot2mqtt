@@ -16,12 +16,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import argparse
 import asyncio
+import collections
 import configparser
 import copy
 import json
 import logging
 import os
 import sys
+from typing import List, Optional
 
 try:
     import aiomqtt
@@ -32,7 +34,97 @@ except ImportError:
 HOST = '0.0.0.0'
 PORT = 31270
 
+# Largest amount of data from one fan that may stay unparsed. A complete
+# message is well below 1 KiB, so more than this means a broken object.
+MAX_BUFFER_SIZE = 4 * 1024
+
+# Deepest nesting accepted in a message. Fan messages are two levels deep.
+MAX_DEPTH = 8
+
 logger = logging.getLogger("main")
+
+
+class JsonStreamParser:
+    """
+    Splits the TCP byte stream sent by a fan into JSON objects.
+
+    The fans send JSON objects back to back without any delimiter. A single
+    read() can therefore contain several objects, or only a part of one.
+    Incomplete data is kept until the rest arrives.
+    """
+
+    def __init__(self, max_size: int = MAX_BUFFER_SIZE):
+        self._buffer = b""
+        self._max_size = max_size
+
+    @staticmethod
+    def _find_object_end(buffer: bytes) -> int:
+        """
+        Returns the index right after the JSON object that starts at the
+        beginning of `buffer`, -1 if the object is not complete yet, or -2 if
+        it nests deeper than MAX_DEPTH. Braces inside strings are ignored.
+        Scanning bytes is safe because all characters checked here are ASCII
+        and never occur inside multi-byte UTF-8 sequences.
+        """
+        depth = 0
+        in_string = False
+        escaped = False
+        for index, char in enumerate(buffer):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == 0x5C:  # backslash
+                    escaped = True
+                elif char == 0x22:  # double quote
+                    in_string = False
+            elif char == 0x22:
+                in_string = True
+            elif char == 0x7B:  # {
+                depth += 1
+                if depth > MAX_DEPTH:
+                    return -2
+            elif char == 0x7D:  # }
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+        return -1
+
+    def feed(self, data: bytes) -> List[dict]:
+        """
+        Adds received data and returns all JSON objects completed by it.
+        """
+        self._buffer += data
+        messages = []
+        while self._buffer:
+            start = self._buffer.find(b"{")
+            if start == -1:
+                if self._buffer.strip():
+                    logger.warning("Discarding non-JSON data: %r", self._buffer[:100])
+                self._buffer = b""
+                break
+            if self._buffer[:start].strip():
+                logger.warning("Discarding non-JSON data: %r", self._buffer[:start][:100])
+            self._buffer = self._buffer[start:]
+
+            end = self._find_object_end(self._buffer)
+            if end == -1 and len(self._buffer) <= self._max_size:
+                break
+            if end < 0:
+                # An object that never closes would swallow every following
+                # message, so give up on it and look for the next one.
+                logger.warning("Broken JSON object, skipping to the next one: %r", self._buffer[:100])
+                next_start = self._buffer.find(b"{", 1)
+                self._buffer = self._buffer[next_start:] if next_start != -1 else b""
+                continue
+
+            raw, self._buffer = self._buffer[:end], self._buffer[end:]
+            try:
+                message = json.loads(raw.decode())
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                logger.warning("Invalid JSON received, ignoring: %r", raw[:100])
+                continue
+            messages.append(message)
+        return messages
 
 
 class DreamMakerIotClient:
@@ -57,13 +149,14 @@ class DreamMakerIotClient:
         self.client_ip = addr[0]
         self.stream_reader = stream_reader
         self.stream_writer = stream_writer
+        self.parser = JsonStreamParser()
+        self.pending_messages = collections.deque()
 
     async def async_authenticate_client(self) -> bool:
         while not self.is_connection_closed():
             message = await self.async_get_data()
-            if not message:
-                logger.warning("Empty message...")
-                continue
+            if message is None:
+                return False
             # Provisioning request
             if message["action"] == 1 and message["resource_id"] == 2000:
                 logger.info("Received provisioning request, sending data...")
@@ -78,18 +171,25 @@ class DreamMakerIotClient:
         return False
     
     def is_connection_closed(self):
-        return self.stream_reader.at_eof()
-    
-    async def async_get_data(self) -> dict:
-         data = await self.stream_reader.read(1024)
-         if not data:
-             return {}
-         else:
-             try:
-                 return json.loads(data.decode())
-             except json.decoder.JSONDecodeError:
-                 logger.warning("Invalid JSON received, ignoring...")
-                 return {}
+        return self.stream_reader.at_eof() and not self.pending_messages
+
+    async def async_get_data(self) -> Optional[dict]:
+        """
+        Returns the next complete message from the fan, or None once the
+        connection has been closed.
+        """
+        while not self.pending_messages:
+            data = await self.stream_reader.read(1024)
+            if not data:
+                return None
+            for message in self.parser.feed(data):
+                # Every protocol message carries a numeric action and resource id
+                if (isinstance(message, dict) and isinstance(message.get("action"), int)
+                        and isinstance(message.get("resource_id"), int)):
+                    self.pending_messages.append(message)
+                else:
+                    logger.warning("Ignoring message without action/resource_id: %r", message)
+        return self.pending_messages.popleft()
     
     async def async_send_data(self, data: dict):
         message = json.dumps(data).encode()
