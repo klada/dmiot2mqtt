@@ -189,8 +189,17 @@ class DreamMakerIotClient:
     # Topics and session registry
     # ------------------------------------------------------------------
 
+    def has_usable_device_id(self) -> bool:
+        # Fans provisioned through this bridge all get the same all-zero id
+        # (see async_send_provisioning_data), so it cannot tell them apart.
+        return bool(self.device_id and self.device_id.strip("0"))
+
     def get_topic_base(self) -> str:
-        return f"{MqttConfig.base_topic}/{self.client_ip.lower()}"
+        if MqttConfig.topic_id == "device_id" and self.has_usable_device_id():
+            identifier = self.device_id
+        else:
+            identifier = self.client_ip
+        return f"{MqttConfig.base_topic}/{identifier.lower()}"
 
     def get_command_topic(self) -> str:
         return f"{self.get_topic_base()}/command"
@@ -213,6 +222,11 @@ class DreamMakerIotClient:
         power reconnects while the server may still hold the old connection,
         so the old session is closed here.
         """
+        if MqttConfig.topic_id == "device_id" and not self.has_usable_device_id():
+            logger.warning(
+                "Fan %s has no unique device id (%r), using its IP address in the topic",
+                self.client_ip, self.device_id
+            )
         self.session_key = self.get_topic_base()
         # A fixed client id per fan lets the broker replace a stale session
         # (and drop its last will) instead of keeping both.
@@ -507,6 +521,8 @@ class MqttConfig:
     password = None
     use_ssl = False
     retain = False
+    # Which value identifies a fan in the MQTT topic: "ip" or "device_id"
+    topic_id = "ip"
     
     @classmethod
     def get_uri(cls):
@@ -544,6 +560,11 @@ class MqttConfig:
         cls.password = config["mqtt"].get("password", None)
         cls.use_ssl = config["mqtt"].getboolean("use_ssl", False)
         cls.retain = config["mqtt"].getboolean("retain", False)
+        topic_id = config["mqtt"].get("topic_id", cls.topic_id).strip().lower()
+        if topic_id not in ("ip", "device_id"):
+            logger.warning("Unknown topic_id %r, using 'ip'", topic_id)
+            topic_id = "ip"
+        cls.topic_id = topic_id
     
     @classmethod
     def get_mqtt_client_kwargs(cls, identifier: Optional[str] = None, will: Optional["aiomqtt.Will"] = None) -> dict:

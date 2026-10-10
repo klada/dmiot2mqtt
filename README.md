@@ -23,7 +23,7 @@ This is what you need in order to get started:
 * Python 3.9 (or later) with aiomqtt (Version 2.2 or later)
 * A MQTT broker
 * Ideally an always-on machine which will run dmiot2mqtt (e.g. a Raspberry Pi)
-* A static IP adress for your Dream Maker Smart Fan (IP will be used in MQTT topic)
+* A static IP adress for your Dream Maker Smart Fan (IP will be used in MQTT topic), unless you use `topic_id = device_id` (see below)
 * Recommended: Any Linux machine with a Bluetooth 4.0+ dongle for provisioning the fan without the Dream Maker app (one-time only)
 
 ## How to get this running?
@@ -48,15 +48,18 @@ section | option | default | explanation
 `mqtt` | `user`, `password` | none | Broker credentials
 `mqtt` | `use_ssl` | `0` | Connect to the broker over TLS, verifying its certificate against the system CAs
 `mqtt` | `retain` | `0` | Publish the fan state as retained message, so Home Assistant knows it right after a restart
+`mqtt` | `topic_id` | `ip` | Identify a fan in the topic by `ip` or by `device_id`. See the note below
 `bridge` | `read_timeout` | `90` | Seconds without any data before a fan connection is treated as dead, `0` or less disables it. The 10-second heartbeat in doc/protocol.md is not verified for every model: if a fan (e.g. the battery-powered DM-FAN02-W) is dropped every `read_timeout` seconds, raise the value
+
+With `topic_id = device_id` the fan does not need a static IP. This only works for fans that were provisioned through the official Dream Maker app and cloud: they keep the unique device id they got there. Fans provisioned through `provision.py` and this bridge all get the same all-zero device id; for those the bridge falls back to the IP address and logs a warning.
 
 ## MQTT topics
 
-Topics per fan (`<ip>` is the fan's IP address):
+Topics per fan (`<id>` is the fan's IP address, or its device id with `topic_id = device_id`):
 
-* `dmiot2mqtt/<ip>`: full fan state as JSON
-* `dmiot2mqtt/<ip>/command`: commands, one JSON object per message, e.g. `{"power": 1}`
-* `dmiot2mqtt/<ip>/availability`: `online` / `offline`, retained, also set as MQTT last will
+* `dmiot2mqtt/<id>`: full fan state as JSON
+* `dmiot2mqtt/<id>/command`: commands, one JSON object per message, e.g. `{"power": 1}`
+* `dmiot2mqtt/<id>/availability`: `online` / `offline`, retained, also set as MQTT last will
 
 The bridge keeps the fan connection open while the broker is unavailable and reconnects after 5 seconds, doubling the delay up to 60 seconds.
 The last state received in the meantime is published after the reconnect.
@@ -65,7 +68,7 @@ Each fan gets a fixed MQTT client id, `dmiot2mqtt-` followed by its topic with `
 Two bridge instances connected to the same broker therefore need different `base_topic` values.
 
 When a fan reconnects (e.g. after losing WiFi) while its old connection is still open, the old connection is closed.
-Two different fans behind one IP address (NAT) share a topic. If they report different device ids, the bridge keeps both connections and logs an error, but commands then reach both fans; give them different IP addresses. Fans provisioned through `provision.py` and this bridge all report the same all-zero device id and cannot be told apart at all, so behind one IP address they replace each other's connection over and over.
+Two different fans behind one IP address (NAT) share a topic unless `topic_id = device_id` is used. If they report different device ids, the bridge keeps both connections and logs an error, but with `topic_id = ip` commands then reach both fans; use `topic_id = device_id` or give them different IP addresses. Fans provisioned through `provision.py` and this bridge all report the same all-zero device id and cannot be told apart at all, so behind one IP address they replace each other's connection over and over; they need different IP addresses.
 A connection without any data for `read_timeout` seconds is treated as dead; the fans send a heartbeat every 10 seconds.
 
 ## Home Assistant integration
