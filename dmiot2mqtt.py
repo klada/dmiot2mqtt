@@ -53,6 +53,10 @@ MQTT_STABLE_CONNECTION = 30
 # Seconds allowed for publishing "offline" when a fan disconnects.
 AVAILABILITY_TIMEOUT = 2
 
+# Seconds between two diagnostics updates caused only by a changed WiFi
+# signal. The fans report it with every heartbeat, i.e. every 10 seconds.
+DIAGNOSTICS_INTERVAL = 300
+
 # Seconds a fan may take to accept data we send before its connection is
 # treated as dead, and to close the connection at the end of a session.
 WRITE_TIMEOUT = 10
@@ -160,9 +164,13 @@ class DreamMakerIotClient:
     RESOURCE_PROVISIONING = 2000
     RESOURCE_AUTH = 2001
 
-    # Never published to MQTT: heartbeats would spam the broker, and the
+    # Never published as state: heartbeats would spam the broker, and the
     # auth/provisioning messages carry the device key.
     UNPUBLISHED_RESOURCES = {RESOURCE_STATUS, RESOURCE_PROVISIONING, RESOURCE_AUTH}
+
+    # Heartbeat fields published on the diagnostics topic; nothing else from
+    # the heartbeat is passed on.
+    DIAGNOSTIC_FIELDS = ("signal", "comm_version", "mcu_version", "rf_version")
     
     MAP_MODES = {
         0: "direct",
@@ -185,6 +193,9 @@ class DreamMakerIotClient:
         self.superseded = False
         self.mqtt_client: Optional[aiomqtt.Client] = None
         self.last_state: Optional[dict] = None
+        self.diagnostics: Optional[dict] = None
+        self.published_diagnostics: Optional[dict] = None
+        self.diagnostics_published_at: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Topics and session registry
@@ -210,6 +221,9 @@ class DreamMakerIotClient:
 
     def get_availability_topic(self) -> str:
         return f"{self.get_topic_base()}/availability"
+
+    def get_diagnostics_topic(self) -> str:
+        return f"{self.get_topic_base()}/diagnostics"
 
     def get_mqtt_identifier(self) -> str:
         return self.mqtt_identifier
@@ -347,6 +361,9 @@ class DreamMakerIotClient:
     async def async_handle_fan_message(self, message: dict):
         logger.debug(message)
         await self.async_ack_message(message)
+        if message["resource_id"] == self.RESOURCE_STATUS:
+            await self.async_handle_heartbeat(message.get("data"))
+            return
         if message["resource_id"] in self.UNPUBLISHED_RESOURCES:
             return
         data = message.get("data")
@@ -369,6 +386,46 @@ class DreamMakerIotClient:
             )
         except aiomqtt.MqttError as e:
             logger.warning("Publishing state failed: %s", e)
+
+    async def async_handle_heartbeat(self, data):
+        if not isinstance(data, dict):
+            return
+        diagnostics = {field: data[field] for field in self.DIAGNOSTIC_FIELDS if field in data}
+        if not diagnostics:
+            return
+        self.diagnostics = diagnostics
+        await self.async_publish_diagnostics()
+
+    async def async_publish_diagnostics(self, force: bool = False):
+        """
+        Publishes the latest diagnostics when they differ from the published
+        ones. A change of the WiFi signal alone is published at most every
+        DIAGNOSTICS_INTERVAL seconds, as it changes with almost every heartbeat.
+        """
+        diagnostics = self.diagnostics
+        client = self.mqtt_client
+        if diagnostics is None or client is None:
+            return
+        published = self.published_diagnostics
+        now = asyncio.get_running_loop().time()
+        if not force and published is not None:
+            if diagnostics == published:
+                return
+            only_signal_changed = all(
+                diagnostics.get(field) == published.get(field)
+                for field in self.DIAGNOSTIC_FIELDS if field != "signal"
+            )
+            if only_signal_changed and now - self.diagnostics_published_at < DIAGNOSTICS_INTERVAL:
+                return
+        try:
+            await client.publish(
+                self.get_diagnostics_topic(), payload=json.dumps(diagnostics).encode(), retain=True
+            )
+        except aiomqtt.MqttError as e:
+            logger.warning("Publishing diagnostics failed: %s", e)
+            return
+        self.published_diagnostics = diagnostics
+        self.diagnostics_published_at = now
 
     async def async_publish_availability(self, payload: bytes) -> bool:
         client = self.mqtt_client
@@ -538,6 +595,16 @@ class DreamMakerIotClient:
                 "state_topic": state_topic,
                 "value_template": "{{ value_json.humidity }}",
             }),
+            ("sensor", "signal", {
+                # The protocol notes give no unit for the signal value
+                "name": "WiFi signal",
+                "icon": "mdi:wifi",
+                "entity_category": "diagnostic",
+                "state_class": "measurement",
+                "state_topic": self.get_diagnostics_topic(),
+                "value_template": "{{ value_json.signal }}",
+                "json_attributes_topic": self.get_diagnostics_topic(),
+            }),
         ]
 
         configs = []
@@ -596,6 +663,8 @@ class DreamMakerIotClient:
                     await self.async_publish_availability(b"online")
                     if self.last_state is not None:
                         await self.async_publish_state(self.last_state)
+                    # The broker may have lost the retained message
+                    await self.async_publish_diagnostics(force=True)
                     async for message in client.messages:
                         if message.topic.matches(self.get_ha_status_topic()):
                             await self.async_handle_ha_status(client, message.payload)

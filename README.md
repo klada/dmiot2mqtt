@@ -62,6 +62,7 @@ Topics per fan (`<id>` is the fan's IP address, or its device id with `topic_id 
 * `dmiot2mqtt/<id>`: full fan state as JSON
 * `dmiot2mqtt/<id>/command`: commands, one JSON object per message, e.g. `{"power": 1}`
 * `dmiot2mqtt/<id>/availability`: `online` / `offline`, retained, also set as MQTT last will
+* `dmiot2mqtt/<id>/diagnostics`: WiFi signal and firmware versions from the fan's heartbeat as JSON, retained, e.g. `{"signal": 94, "rf_version": "v3.1.6", ...}`. A change of the firmware versions is published at once, a change of the signal alone at most every 5 minutes.
 
 The bridge keeps the fan connection open while the broker is unavailable and reconnects after 5 seconds, doubling the delay up to 60 seconds.
 The last state received in the meantime is published after the reconnect.
@@ -95,6 +96,7 @@ Oscillation angle | `select` | `roll_angle`
 Off timer | `number`, 0 to 480 minutes | `power_delay`
 LED indicators, Button sounds, Child lock | `switch` | `light`, `sound`, `child_lock`
 Temperature, Humidity | `sensor` | `temperature`, `humidity`
+WiFi signal | diagnostic `sensor`, firmware versions as attributes | `signal` on the diagnostics topic
 
 The discovery messages are retained and published again whenever the bridge connects to the broker. When Home Assistant reports on `homeassistant/status` (with your `discovery_prefix`) that it has started, the bridge publishes them again together with the last fan state, so Home Assistant knows the state even without `retain = 1`.
 Temperature and humidity come with the fan's state update. doc/protocol.md describes that update after a change of the fan's status; how often a fan sends one when only the temperature changes is not documented, so the sensors may stay empty until the first change or command.

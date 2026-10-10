@@ -774,6 +774,9 @@ async def test_broker_restart_keeps_fan_connected(bridge, bridge_config):
     try:
         async with Subscriber(port, f"{MqttConfig.base_topic}/#") as subscriber:
             fan = await connect_online(bridge, subscriber)
+            await fan.send(HEARTBEAT)
+            await fan.receive_ack(127)
+            await subscriber.wait_for(topic("diagnostics"))
 
         stop_mosquitto(proc, conf_name)
         proc = None
@@ -788,6 +791,10 @@ async def test_broker_restart_keeps_fan_connected(bridge, bridge_config):
             await subscriber.wait_for(topic("availability"), b"online", timeout=5)
             message = await subscriber.wait_for(topic(), timeout=5)
             assert json.loads(message.payload) == STATE["data"]
+            # The new broker lost the retained diagnostics, so they come again
+            # although they have not changed
+            message = await subscriber.wait_for(topic("diagnostics"), timeout=5)
+            assert json.loads(message.payload) == HEARTBEAT["data"]
             # The command subscription is restored as well
             async with aiomqtt.Client("127.0.0.1", port=port) as client:
                 await client.publish(topic("command"), b'{"power": 1}')
@@ -832,6 +839,7 @@ async def test_all_zero_device_id_falls_back_to_ip(broker, bridge, bridge_config
 DISCOVERED = {
     ("fan", "fan"), ("select", "roll_angle"), ("number", "power_delay"), ("switch", "light"),
     ("switch", "sound"), ("switch", "child_lock"), ("sensor", "temperature"), ("sensor", "humidity"),
+    ("sensor", "signal"),
 }
 
 
@@ -908,6 +916,7 @@ def test_discovery_templates_produce_fan_commands(clean_config):
     assert state("light", "value_template", data) == configs["light"]["state_on"]
     assert state("temperature", "value_template", data) == "23.6"
     assert state("humidity", "value_template", data) == "64"
+    assert state("signal", "value_template", {"signal": 94}) == "94"
 
 
 @needs_broker
@@ -987,3 +996,66 @@ async def test_state_is_sent_again_when_home_assistant_starts(broker, bridge, br
             message = await subscriber.wait_for(topic())
             assert json.loads(message.payload) == STATE["data"]
             await wait_until(lambda: len(discovery.messages) == len(DISCOVERED))
+
+
+# ----------------------------------------------------------------------
+# Diagnostics from the heartbeat
+# ----------------------------------------------------------------------
+
+def heartbeat(signal, rf_version="v3.1.6", **extra):
+    data = {"comm_version": "dmiot_v1.1.0", "mcu_version": "fan_0001", "rf_version": rf_version,
+            "signal": signal, **extra}
+    return {"action": 1, "resource_id": 127, "version": "zeico_3.0.0", "data": data}
+
+
+@needs_broker
+async def test_heartbeat_diagnostics_are_published_retained(broker, bridge, bridge_config):
+    bridge_config(broker)
+    async with Subscriber(broker, f"{MqttConfig.base_topic}/#") as subscriber:
+        fan = await connect_online(bridge, subscriber)
+        await fan.send(heartbeat(94, device_key="secretkey0000000", ssid="home"))
+        await fan.receive_ack(127)
+        message = await subscriber.wait_for(topic("diagnostics"))
+    assert json.loads(message.payload) == {
+        "comm_version": "dmiot_v1.1.0", "mcu_version": "fan_0001", "rf_version": "v3.1.6", "signal": 94,
+    }
+    assert json.loads(await retained_payload(broker, topic("diagnostics")))["signal"] == 94
+    # The heartbeat is still not published as fan state
+    assert subscriber.payloads(topic()) == []
+
+
+@needs_broker
+async def test_signal_changes_are_rate_limited(broker, bridge, bridge_config, monkeypatch):
+    bridge_config(broker)
+    monkeypatch.setattr(dmiot2mqtt, "DIAGNOSTICS_INTERVAL", 0.5)
+    async with Subscriber(broker, f"{MqttConfig.base_topic}/#") as subscriber:
+        fan = await connect_online(bridge, subscriber)
+
+        async def send(message):
+            await fan.send(message)
+            await fan.receive_ack(127)
+
+        def signals():
+            return [json.loads(p)["signal"] for p in subscriber.payloads(topic("diagnostics"))]
+
+        await send(heartbeat(94))
+        await subscriber.wait_for(topic("diagnostics"))
+        await send(heartbeat(94))  # unchanged
+        await send(heartbeat(90))  # signal only, too early
+        await send(heartbeat(91))
+        await asyncio.sleep(0.2)
+        assert signals() == [94]
+        await asyncio.sleep(0.4)
+        await send(heartbeat(92))  # the interval has passed
+        await wait_until(lambda: signals() == [94, 92])
+        # A firmware change is published at once
+        await send(heartbeat(92, rf_version="v3.1.7"))
+        await wait_until(lambda: len(signals()) == 3)
+        await send(heartbeat(93, rf_version="v3.1.7"))
+        await asyncio.sleep(0.2)
+        assert signals() == [94, 92, 92]
+        # Unchanged diagnostics are not repeated after the interval either
+        await asyncio.sleep(0.4)
+        await send(heartbeat(92, rf_version="v3.1.7"))
+        await asyncio.sleep(0.2)
+        assert signals() == [94, 92, 92]
