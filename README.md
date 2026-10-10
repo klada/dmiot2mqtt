@@ -36,6 +36,24 @@ This is what you need in order to get started:
 6. Wait until your fan connects to the service.
 7. Create a systemd unit file for dmiot2mqtt.py according to your needs.
 
+## MQTT topics
+
+Topics per fan (`<ip>` is the fan's IP address):
+
+* `dmiot2mqtt/<ip>`: full fan state as JSON
+* `dmiot2mqtt/<ip>/command`: commands, one JSON object per message, e.g. `{"power": 1}`
+* `dmiot2mqtt/<ip>/availability`: `online` / `offline`, retained, also set as MQTT last will
+
+The bridge keeps the fan connection open while the broker is unavailable and reconnects after 5 seconds, doubling the delay up to 60 seconds.
+The last state received in the meantime is published after the reconnect.
+
+Each fan gets a fixed MQTT client id, `dmiot2mqtt-` followed by its topic with `/` replaced by `-`.
+Two bridge instances connected to the same broker therefore need different `base_topic` values.
+
+When a fan reconnects (e.g. after losing WiFi) while its old connection is still open, the old connection is closed.
+Two different fans behind one IP address (NAT) share a topic. If they report different device ids, the bridge keeps both connections and logs an error, but commands then reach both fans; give them different IP addresses. Fans provisioned through `provision.py` and this bridge all report the same all-zero device id and cannot be told apart at all, so behind one IP address they replace each other's connection over and over.
+A connection without any data for 90 seconds is treated as dead; the fans send a heartbeat every 10 seconds.
+
 ## Home Assistant integration
 
 Once you have your fan talking to dmiot2mqtt you can integrate it into Home Assistant.
@@ -47,6 +65,7 @@ mqtt:
   fan:
     - name: "DreamMaker Fan"
       unique_id: "mqtt_fan_dmfan01"
+      availability_topic: "dmiot2mqtt/192.168.100.5/availability"
       command_topic: "dmiot2mqtt/192.168.100.5/command"
       command_template: '{ "power": {{ value }} }'
       oscillation_command_topic: "dmiot2mqtt/192.168.100.5/command"

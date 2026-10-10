@@ -21,9 +21,9 @@ import configparser
 import copy
 import json
 import logging
-import os
+import secrets
 import sys
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 try:
     import aiomqtt
@@ -40,6 +40,21 @@ MAX_BUFFER_SIZE = 4 * 1024
 
 # Deepest nesting accepted in a message. Fan messages are two levels deep.
 MAX_DEPTH = 8
+
+# Seconds to wait before reconnecting to the MQTT broker after a failure. The
+# delay doubles with every failed attempt, up to MQTT_MAX_RECONNECT_DELAY,
+# and is reset once a connection has lasted MQTT_STABLE_CONNECTION seconds.
+MQTT_RECONNECT_DELAY = 5
+MQTT_MAX_RECONNECT_DELAY = 60
+MQTT_STABLE_CONNECTION = 30
+
+# Seconds allowed for publishing "offline" when a fan disconnects.
+AVAILABILITY_TIMEOUT = 2
+
+# Seconds a fan may take to accept data we send before its connection is
+# treated as dead, and to close the connection at the end of a session.
+WRITE_TIMEOUT = 10
+CLOSE_TIMEOUT = 2
 
 logger = logging.getLogger("main")
 
@@ -127,6 +142,10 @@ class JsonStreamParser:
         return messages
 
 
+# Active session per fan, keyed by its MQTT topic
+ACTIVE_SESSIONS: Dict[str, "DreamMakerIotClient"] = {}
+
+
 class DreamMakerIotClient:
     """
     Wrapper which handles the communication for one client connection.
@@ -136,6 +155,12 @@ class DreamMakerIotClient:
     COMMAND_TEMPLATE = {"action":4, "resource_id": 9031, "version":"zeico_3.0.0", "msg_id": 0}
     
     RESOURCE_STATUS = 127
+    RESOURCE_PROVISIONING = 2000
+    RESOURCE_AUTH = 2001
+
+    # Never published to MQTT: heartbeats would spam the broker, and the
+    # auth/provisioning messages carry the device key.
+    UNPUBLISHED_RESOURCES = {RESOURCE_STATUS, RESOURCE_PROVISIONING, RESOURCE_AUTH}
     
     MAP_MODES = {
         0: "direct",
@@ -151,35 +176,107 @@ class DreamMakerIotClient:
         self.stream_writer = stream_writer
         self.parser = JsonStreamParser()
         self.pending_messages = collections.deque()
+        self.send_lock = asyncio.Lock()
+        self.device_id: Optional[str] = None
+        self.session_key: Optional[str] = None
+        self.mqtt_identifier: Optional[str] = None
+        self.superseded = False
+        self.mqtt_client: Optional[aiomqtt.Client] = None
+        self.last_state: Optional[dict] = None
+
+    # ------------------------------------------------------------------
+    # Topics and session registry
+    # ------------------------------------------------------------------
+
+    def get_topic_base(self) -> str:
+        return f"{MqttConfig.base_topic}/{self.client_ip.lower()}"
+
+    def get_command_topic(self) -> str:
+        return f"{self.get_topic_base()}/command"
+
+    def get_availability_topic(self) -> str:
+        return f"{self.get_topic_base()}/availability"
+
+    def get_mqtt_identifier(self) -> str:
+        return self.mqtt_identifier
+
+    def is_same_fan(self, other: "DreamMakerIotClient") -> bool:
+        # Fans are told apart by device id. Without one, assume the same fan.
+        if not self.device_id or not other.device_id:
+            return True
+        return self.device_id == other.device_id
+
+    def register_session(self):
+        """
+        Makes this the active session for its fan. A fan that lost WiFi or
+        power reconnects while the server may still hold the old connection,
+        so the old session is closed here.
+        """
+        self.session_key = self.get_topic_base()
+        # A fixed client id per fan lets the broker replace a stale session
+        # (and drop its last will) instead of keeping both.
+        self.mqtt_identifier = "dmiot2mqtt-" + self.session_key.replace("/", "-")
+        previous = ACTIVE_SESSIONS.get(self.session_key)
+        if previous is not None and previous is not self and not self.is_same_fan(previous):
+            # Two fans behind one IP address (e.g. NAT): closing the other one
+            # would make them kick each other out forever.
+            logger.error(
+                "Fans %s and %s share the topic %s; use topic_id = device_id or give them "
+                "different IP addresses", previous.device_id, self.device_id, self.session_key
+            )
+            self.mqtt_identifier += "-" + secrets.token_hex(4)
+            return
+        ACTIVE_SESSIONS[self.session_key] = self
+        if previous is not None and previous is not self:
+            logger.info("Fan %s reconnected, closing its previous connection", self.session_key)
+            previous.supersede()
+
+    def is_active_session(self) -> bool:
+        return self.session_key is not None and ACTIVE_SESSIONS.get(self.session_key) is self
+
+    def supersede(self):
+        self.superseded = True
+        self.stream_writer.transport.abort()
+
+    # ------------------------------------------------------------------
+    # Fan side (TCP)
+    # ------------------------------------------------------------------
 
     async def async_authenticate_client(self) -> bool:
-        while not self.is_connection_closed():
+        while True:
             message = await self.async_get_data()
             if message is None:
                 return False
             # Provisioning request
-            if message["action"] == 1 and message["resource_id"] == 2000:
+            if message["action"] == 1 and message["resource_id"] == self.RESOURCE_PROVISIONING:
                 logger.info("Received provisioning request, sending data...")
                 logger.debug(message)
                 await self.async_send_provisioning_data()
             # Auth request
-            elif message["action"] == 1 and message["resource_id"] == 2001:
+            elif message["action"] == 1 and message["resource_id"] == self.RESOURCE_AUTH:
                 logger.info("Auth handshake")
                 logger.debug(message)
+                data = message.get("data")
+                if isinstance(data, dict) and data.get("device_id"):
+                    self.device_id = str(data["device_id"])
                 await self.async_ack_message(message)
                 return True
-        return False
-    
-    def is_connection_closed(self):
-        return self.stream_reader.at_eof() and not self.pending_messages
 
     async def async_get_data(self) -> Optional[dict]:
         """
         Returns the next complete message from the fan, or None once the
-        connection has been closed.
+        connection has been closed or has been silent for too long.
         """
         while not self.pending_messages:
-            data = await self.stream_reader.read(1024)
+            timeout = BridgeConfig.read_timeout if BridgeConfig.read_timeout > 0 else None
+            try:
+                data = await asyncio.wait_for(self.stream_reader.read(1024), timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "No data from %s for %d seconds, closing the connection",
+                    self.client_ip, BridgeConfig.read_timeout
+                )
+                return None
             if not data:
                 return None
             for message in self.parser.feed(data):
@@ -193,9 +290,19 @@ class DreamMakerIotClient:
     
     async def async_send_data(self, data: dict):
         message = json.dumps(data).encode()
-        self.stream_writer.write(message)
-        logger.debug("Sending: {}".format(message))
-        await self.stream_writer.drain()
+        # ACKs from the main loop and commands from the MQTT task may write
+        # at the same time
+        async with self.send_lock:
+            self.stream_writer.write(message)
+            logger.debug("Sending: {}".format(message))
+            try:
+                await asyncio.wait_for(self.stream_writer.drain(), WRITE_TIMEOUT)
+            except asyncio.TimeoutError:
+                # The fan does not read anymore. Without this, a session
+                # blocked here would never notice the read timeout.
+                logger.warning("Fan %s does not accept data, closing the connection", self.client_ip)
+                self.stream_writer.transport.abort()
+                raise ConnectionResetError("write timeout")
         
     async def async_send_command(self, command_data: dict):
         message = copy.copy(self.COMMAND_TEMPLATE)
@@ -212,28 +319,125 @@ class DreamMakerIotClient:
     
     async def async_send_provisioning_data(self):
         response = copy.copy(self.REPLY_TEMPLATE)
-        response["resource_id"] = 2000
+        response["resource_id"] = self.RESOURCE_PROVISIONING
         response["action"] = 81
         # Just add a dummy device_key/device_id. We won't need this information later.
         response["data"] = {"device_key":"0000000000000000", "device_id":"000000000000000000000000"}
         await self.async_send_data(response)
  
-    async def async_mqtt_listen(self):
-        async with aiomqtt.Client(**MqttConfig.get_mqtt_client_kwargs()) as mqtt_client:
-            logger.debug("in with mqtt")
+    async def async_handle_fan_message(self, message: dict):
+        logger.debug(message)
+        await self.async_ack_message(message)
+        if message["resource_id"] in self.UNPUBLISHED_RESOURCES:
+            return
+        data = message.get("data")
+        if isinstance(data, dict):
+            await self.async_publish_state(data)
             
-            mqtt_base = os.path.join(MqttConfig.base_topic, self.client_ip.lower())
-            mqtt_command_topic = os.path.join(mqtt_base, "command")
+    # ------------------------------------------------------------------
+    # MQTT side
+    # ------------------------------------------------------------------
 
-            # Async MQTT subscription
-            await mqtt_client.subscribe(mqtt_command_topic)
-            logger.debug("MQTT subscribe to %s finish", mqtt_command_topic)
+    async def async_publish_state(self, data: dict):
+        self.last_state = data
+        client = self.mqtt_client
+        if client is None:
+            logger.warning("MQTT not connected, state will be published after reconnect")
+            return
+        try:
+            await client.publish(self.get_topic_base(), payload=json.dumps(data).encode())
+        except aiomqtt.MqttError as e:
+            logger.warning("Publishing state failed: %s", e)
 
-            async for message in mqtt_client.messages:
-                logger.debug("Received command {}".format(message.payload.decode()))
-                command = json.loads(message.payload.decode())
-                await self.async_send_command(command)
+    async def async_publish_availability(self, payload: bytes) -> bool:
+        client = self.mqtt_client
+        if client is None:
+            return False
+        try:
+            await asyncio.wait_for(
+                client.publish(self.get_availability_topic(), payload=payload, qos=1, retain=True),
+                AVAILABILITY_TIMEOUT
+            )
+        except (aiomqtt.MqttError, asyncio.TimeoutError) as e:
+            logger.warning("Publishing availability failed: %r", e)
+            return False
+        return True
 
+    async def async_publish_offline_once(self):
+        """
+        Publishes "offline" through a short-lived connection, for a session
+        that ends while it has no MQTT connection (right after connecting, or
+        during a broker outage). It uses its own client id, so it cannot take
+        over the connection of a session the fan has just opened again.
+        """
+        kwargs = MqttConfig.get_mqtt_client_kwargs(identifier=self.get_mqtt_identifier() + "-offline")
+
+        async def publish():
+            async with aiomqtt.Client(**kwargs) as client:
+                await client.publish(self.get_availability_topic(), payload=b"offline", qos=1, retain=True)
+
+        try:
+            await asyncio.wait_for(publish(), AVAILABILITY_TIMEOUT)
+        except (aiomqtt.MqttError, asyncio.TimeoutError) as e:
+            logger.warning("Could not publish offline availability: %r", e)
+
+    async def async_handle_mqtt_command(self, payload):
+        try:
+            if isinstance(payload, (bytes, bytearray)):
+                payload = payload.decode()
+            command = json.loads(payload)
+        except (UnicodeDecodeError, TypeError, json.JSONDecodeError):
+            logger.warning("Ignoring invalid MQTT command: %r", payload)
+            return
+        if not isinstance(command, dict) or not command:
+            logger.warning("Ignoring MQTT command that is not a JSON object: %r", payload)
+            return
+        logger.debug("Received command %s", command)
+        try:
+            await self.async_send_command(command)
+        except (ConnectionError, OSError) as e:
+            logger.warning("Could not send command to fan: %s", e)
+
+    async def async_mqtt_loop(self):
+        """
+        Keeps one MQTT connection for this fan and reconnects when the broker
+        goes away, while the fan connection stays open. Runs until cancelled.
+        """
+        will = aiomqtt.Will(self.get_availability_topic(), b"offline", qos=1, retain=True)
+        kwargs = MqttConfig.get_mqtt_client_kwargs(identifier=self.get_mqtt_identifier(), will=will)
+        delay = MQTT_RECONNECT_DELAY
+        loop = asyncio.get_running_loop()
+        while not self.superseded:
+            connected_at = None
+            try:
+                async with aiomqtt.Client(**kwargs) as client:
+                    self.mqtt_client = client
+                    connected_at = loop.time()
+                    # Subscribe before announcing "online", so a command sent
+                    # in reaction to "online" is not lost
+                    await client.subscribe(self.get_command_topic())
+                    logger.debug("MQTT subscribe to %s finished", self.get_command_topic())
+                    await self.async_publish_availability(b"online")
+                    if self.last_state is not None:
+                        await self.async_publish_state(self.last_state)
+                    async for message in client.messages:
+                        await self.async_handle_mqtt_command(message.payload)
+            except aiomqtt.MqttError as e:
+                logger.warning("MQTT connection lost (%s), reconnecting in %gs", e, delay)
+            except Exception:
+                logger.exception("Unexpected MQTT error, reconnecting in %gs", delay)
+            finally:
+                self.mqtt_client = None
+            # A connection that is dropped right away (e.g. another client
+            # with the same id) must not reset the backoff
+            if connected_at is not None and loop.time() - connected_at >= MQTT_STABLE_CONNECTION:
+                delay = MQTT_RECONNECT_DELAY
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, MQTT_MAX_RECONNECT_DELAY)
+
+    # ------------------------------------------------------------------
+    # Session
+    # ------------------------------------------------------------------
         
     async def async_run(self):
         """
@@ -241,49 +445,55 @@ class DreamMakerIotClient:
         """       
         if not await self.async_authenticate_client():
             return False
-        logger.debug("Client authenticated")
+        self.register_session()
+        logger.info("Client authenticated, publishing on %s", self.get_topic_base())
        
+        mqtt_task = asyncio.ensure_future(self.async_mqtt_loop())
+        try:
+            ##
+            # Main communication loop
+            ##
+            while True:
+                message = await self.async_get_data()
+                if message is None:
+                    break
+                await self.async_handle_fan_message(message)
+        finally:
+            await self.async_end_session(mqtt_task)
+        return True
             
-        # Schedule two tasks, once one of them completes we need to take action
-        tcp_task = asyncio.create_task(self.async_get_data())
-        mqtt_task = asyncio.create_task(self.async_mqtt_listen())
-        
-        ##
-        # Main communication loop
-        ##
-        while not self.is_connection_closed():
-            # run tasks until one of them completes
-            done, pending = await asyncio.wait({tcp_task, mqtt_task}, return_when=asyncio.FIRST_COMPLETED)
-        
-            if tcp_task in done:
-                logger.debug("TCP task done, rescheduling....")
-                message = tcp_task.result()
-                # Make sure to create a new TCP reader task first
-                tcp_task = asyncio.create_task(self.async_get_data())
-            
-                if message:
-                    logger.debug(message)            
-                    await self.async_ack_message(message)
-                    # Don't spam MQTT server with status/heartbeat values
-                    if message["resource_id"] == self.RESOURCE_STATUS:
-                        continue
-                    data = message["data"]
-                    async with aiomqtt.Client(**MqttConfig.get_mqtt_client_kwargs()) as mqtt_client:
-                        logger.debug("mqtt publush")
-                        
-                        mqtt_base = os.path.join(MqttConfig.base_topic, self.client_ip.lower())
-                        await mqtt_client.publish(mqtt_base, payload=json.dumps(data).encode())
-            
-            if mqtt_task in done:
-                logger.debug("MQTT task done, rescheduling....")
-                message = mqtt_task.result()
-                # Make sure to create a new MQTT subscriber task first
-                mqtt_task = asyncio.create_task(self.async_mqtt_listen())
+    async def async_end_session(self, mqtt_task):
+        # A superseded session must not report "offline": the fan is
+        # connected through its newer session.
+        offline_pending = self.is_active_session()
+        if offline_pending:
+            del ACTIVE_SESSIONS[self.session_key]
+            offline_pending = not await self.async_publish_availability(b"offline")
+        mqtt_task.cancel()
+        # gather() returns the task's cancellation as a result, but still
+        # raises if this session itself is being cancelled
+        await asyncio.gather(mqtt_task, return_exceptions=True)
+        # No MQTT connection at the end: publish "offline" separately, unless
+        # the fan has reconnected in the meantime.
+        if offline_pending and self.session_key not in ACTIVE_SESSIONS:
+            await self.async_publish_offline_once()
         
     async def async_stop(self):
         logger.info("Quit....")
         self.stream_writer.close()
-        #await self.mqtt_client.disconnect()
+        try:
+            await asyncio.wait_for(self.stream_writer.wait_closed(), CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            # Data the fan never reads would keep the connection open
+            self.stream_writer.transport.abort()
+        except (ConnectionError, OSError):
+            pass
+
+
+class BridgeConfig:
+    # Seconds without data before a fan connection is treated as dead. The
+    # fans send a heartbeat every 10 seconds. 0 or less disables the timeout.
+    read_timeout = 90
 
 
 class MqttConfig:
@@ -331,14 +541,19 @@ class MqttConfig:
         cls.retain = config["mqtt"].getboolean("retain", False)
     
     @classmethod
-    def get_mqtt_client_kwargs(cls) -> dict:
-        return {
+    def get_mqtt_client_kwargs(cls, identifier: Optional[str] = None, will: Optional["aiomqtt.Will"] = None) -> dict:
+        kwargs = {
             'hostname': cls.server,
             #'port': cls.port,
             'username': cls.user,
             'password': cls.password,
             'clean_session': True,
         }
+        if identifier is not None:
+            kwargs['identifier'] = identifier
+        if will is not None:
+            kwargs['will'] = will
+        return kwargs
 
 
 async def client_connected_callback(reader, writer):
