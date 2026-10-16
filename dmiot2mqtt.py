@@ -284,7 +284,9 @@ class DreamMakerIotClient:
             if message["action"] == 1 and message["resource_id"] == self.RESOURCE_PROVISIONING:
                 logger.info("Received provisioning request, sending data...")
                 logger.debug(message)
-                await self.async_send_provisioning_data()
+                # Use the serial number as device_id for the provisioning process.
+                serial = message["data"].get("sn", None)
+                await self.async_send_provisioning_data(serial)
             # Auth request
             elif message["action"] == 1 and message["resource_id"] == self.RESOURCE_AUTH:
                 logger.info("Auth handshake")
@@ -350,12 +352,14 @@ class DreamMakerIotClient:
         response["resource_id"] = message["resource_id"]
         await self.async_send_data(response)
     
-    async def async_send_provisioning_data(self):
+    async def async_send_provisioning_data(self, device_id=None):
         response = copy.copy(self.REPLY_TEMPLATE)
         response["resource_id"] = self.RESOURCE_PROVISIONING
         response["action"] = 81
-        # Just add a dummy device_key/device_id. We won't need this information later.
+        # Just add a dummy device_key. We won't need this information later as we are not using any authentication here.
         response["data"] = {"device_key":"0000000000000000", "device_id":"000000000000000000000000"}
+        if device_id:
+            response["data"]["device_id"] = device_id
         await self.async_send_data(response)
  
     async def async_handle_fan_message(self, message: dict):
