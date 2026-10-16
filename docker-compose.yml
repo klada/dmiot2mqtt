@@ -1,0 +1,13 @@
+services:
+  dmiot2mqtt:
+    image: ghcr.io/lukaszkusgithub/dmiot2mqtt:latest
+    container_name: dmiot2mqtt
+    restart: unless-stopped
+    # Passes SIGTERM on to the bridge, so "docker stop" does not hang
+    init: true
+    ports:
+      - "31270:31270"
+    volumes:
+      - ./dmiot2mqtt.ini:/config/dmiot2mqtt.ini:ro
+    # For debug logs:
+    # command: ["-c", "/config/dmiot2mqtt.ini", "-l", "DEBUG"]
